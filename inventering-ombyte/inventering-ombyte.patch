@@ -1,0 +1,1390 @@
+diff --git a/artifacts/api-server/src/routes/__tests__/inventeringAvrapporterat.test.ts b/artifacts/api-server/src/routes/__tests__/inventeringAvrapporterat.test.ts
+new file mode 100644
+index 0000000..8ed4eb3
+--- /dev/null
++++ b/artifacts/api-server/src/routes/__tests__/inventeringAvrapporterat.test.ts
+@@ -0,0 +1,252 @@
++// Regressionstest: avrapporterade paket som hittas vid inventering.
++//
++// Scenario (hyvelorder): ordern skrevs med paket A, men paket B plockades
++// (A stod längst in) utan att ordern ändrades. Vid inventeringen står A kvar
++// (avrapporterat) medan B saknas. Inventeringen ska då (1) tala om att A sitter
++// på ordern, (2) föreslå B och (3) rätta order + lager i ett steg.
++//
++// Körs mot den riktiga (dev-)databasen precis som övriga inventeringstester;
++// all testdata prefixas "TEST_" och städas i afterAll.
++import "../../app";
++
++import express from "express";
++import type { Server } from "node:http";
++import { beforeAll, afterAll, describe, test, expect, vi } from "vitest";
++import { clerkClient } from "@clerk/express";
++import { and, eq, inArray } from "drizzle-orm";
++import {
++  db,
++  pool,
++  lagerOmradenTable,
++  lagerFackTable,
++  lagerPosterTable,
++  lagerInventeringarTable,
++  lagerInventeringsomgangarTable,
++  specifikationerTable,
++  specPaketTable,
++} from "@workspace/db";
++import inventeringRouter from "../inventering";
++import inventeringsomgangarRouter from "../inventeringsomgangar";
++
++vi.mock("@clerk/express", async (importOriginal) => {
++  const actual = await importOriginal<typeof import("@clerk/express")>();
++  return {
++    ...actual,
++    getAuth: (req: express.Request & { auth?: () => unknown }) => req.auth?.(),
++  };
++});
++
++function buildTestApp() {
++  const app = express();
++  app.use(express.json());
++  app.use((req, _res, next) => {
++    const userId = String(req.header("x-test-user") ?? "testare");
++    (req as express.Request & { userId?: string; auth?: () => unknown }).userId = userId;
++    (req as express.Request & { auth?: () => unknown }).auth = () => ({
++      userId,
++      sessionId: "test-session",
++      sessionClaims: { userId },
++      tokenType: "session_token",
++    });
++    next();
++  });
++  app.use("/inventering", inventeringRouter);
++  app.use("/inventeringsomgangar", inventeringsomgangarRouter);
++  return app;
++}
++
++let server: Server;
++let baseUrl: string;
++
++async function api<T = any>(method: string, path: string, body?: unknown): Promise<{ status: number; data: T }> {
++  const res = await fetch(`${baseUrl}${path}`, {
++    method,
++    headers: { "content-type": "application/json" },
++    body: body !== undefined ? JSON.stringify(body) : undefined,
++  });
++  const text = await res.text();
++  return { status: res.status, data: (text ? JSON.parse(text) : null) as T };
++}
++
++const omradeIds: number[] = [];
++const fackIds: number[] = [];
++const posterIds: number[] = [];
++const sessionIds: number[] = [];
++const omgangIds: number[] = [];
++const specIds: number[] = [];
++
++async function skapaOmradeOchFack(namn: string) {
++  const [o] = await db.insert(lagerOmradenTable).values({ namn, slug: namn.toLowerCase().replace(/[^a-z0-9]+/g, "-") }).returning();
++  omradeIds.push(o.id);
++  const [f] = await db.insert(lagerFackTable).values({ omradeId: o.id, kod: "A1" }).returning();
++  fackIds.push(f.id);
++  return { omrade: o, fack: f };
++}
++
++async function skapaPost(omradeId: number, fackId: number, pktNr: string, extra: Partial<typeof lagerPosterTable.$inferInsert> = {}) {
++  const [p] = await db
++    .insert(lagerPosterTable)
++    .values({
++      pktNr,
++      omradeId,
++      fackId,
++      traslag: "Furu",
++      nomTjocklek: "50",
++      nomBredd: "100",
++      langdDm: "48",
++      antal: 10,
++      m3: "2.4",
++      ...extra,
++    })
++    .returning();
++  posterIds.push(p.id);
++  return p;
++}
++
++async function skapaBekraftadHyvelorder(lagerPostIds: number[], hyvlingNr: number) {
++  const [spec] = await db
++    .insert(specifikationerTable)
++    .values({ typ: "hyvling", hyvlingNr, kund: "TEST_Kund", status: "bekraftad", bekraftadAt: new Date() })
++    .returning();
++  specIds.push(spec.id);
++  await db.insert(specPaketTable).values(lagerPostIds.map((lagerPostId) => ({ specId: spec.id, lagerPostId, saljPris: "1000", saljSum: "2400" })));
++  return spec;
++}
++
++async function startaSession(omradeId: number, fackId: number, omgangId?: number) {
++  const { data } = await api<{ session: { id: number } }>("POST", "/inventering/start", {
++    omradeId,
++    fackId,
++    ...(omgangId ? { omgangId } : {}),
++  });
++  sessionIds.push(data.session.id);
++  return data.session.id;
++}
++
++beforeAll(async () => {
++  vi.spyOn(clerkClient.users, "getUser").mockImplementation(async (userId) => ({
++    id: userId,
++    publicMetadata: { role: "admin" },
++  }) as never);
++  await new Promise<void>((resolve, reject) => {
++    server = buildTestApp().listen(0, (error?: Error) => (error ? reject(error) : resolve()));
++  });
++  const address = server.address();
++  if (!address || typeof address === "string") throw new Error("Kunde inte starta testservern");
++  baseUrl = `http://127.0.0.1:${address.port}`;
++});
++
++afterAll(async () => {
++  await new Promise<void>((resolve, reject) => server.close((err) => (err ? reject(err) : resolve())));
++  if (omgangIds.length) await db.delete(lagerInventeringsomgangarTable).where(inArray(lagerInventeringsomgangarTable.id, omgangIds));
++  if (sessionIds.length) await db.delete(lagerInventeringarTable).where(inArray(lagerInventeringarTable.id, sessionIds));
++  if (specIds.length) await db.delete(specifikationerTable).where(inArray(specifikationerTable.id, specIds));
++  if (posterIds.length) await db.delete(lagerPosterTable).where(inArray(lagerPosterTable.id, posterIds));
++  if (fackIds.length) await db.delete(lagerFackTable).where(inArray(lagerFackTable.id, fackIds));
++  if (omradeIds.length) await db.delete(lagerOmradenTable).where(inArray(lagerOmradenTable.id, omradeIds));
++  await pool.end();
++});
++
++const idag = new Date().toISOString().slice(0, 10);
++
++describe("Avrapporterat paket hittat vid inventering", () => {
++  test("hyvelorder-ombyte: A hittas kvar, B ersätter A på ordern, lager och order rättas", async () => {
++    const { omrade, fack } = await skapaOmradeOchFack("TEST_Ombyte");
++    const a = await skapaPost(omrade.id, fack.id, "TEST-A");
++    const b = await skapaPost(omrade.id, fack.id, "TEST-B");
++    const c = await skapaPost(omrade.id, fack.id, "TEST-C", { nomTjocklek: "22", nomBredd: "145" });
++    const spec = await skapaBekraftadHyvelorder([a.id], 9001);
++    await db.update(lagerPosterTable).set({ datumUt: idag, avrappTyp: "hyvlat_till_lager" }).where(eq(lagerPosterTable.id, a.id));
++
++    const sessionId = await startaSession(omrade.id, fack.id);
++
++    // 1. Skanning av A talar om att det är avrapporterat och sitter på ordern — ingen skanning sparas.
++    const skan = await api("POST", `/inventering/${sessionId}/skanna`, { pktNr: "TEST-A" });
++    expect(skan.status).toBe(200);
++    expect(skan.data.avrapporterad).toBe(true);
++    expect(skan.data.avrapportering.spec.etikett).toBe("Hyvelorder 9001");
++    expect(skan.data.avrapportering.kanByta).toBe(true);
++    const efterSkan = await api("GET", `/inventering/${sessionId}`);
++    expect(efterSkan.data.skanningar).toHaveLength(0);
++
++    // 2. B föreslås (samma mått, saknas i facket) före C (annat mått utesluts).
++    const kand = await api("GET", `/inventering/${sessionId}/byte-kandidater?pktNr=TEST-A`);
++    expect(kand.status).toBe(200);
++    const pktNrIKandidater = kand.data.data.map((k: { pktNr: string }) => k.pktNr);
++    expect(pktNrIKandidater[0]).toBe("TEST-B");
++    expect(pktNrIKandidater).not.toContain("TEST-C");
++    expect(pktNrIKandidater).not.toContain("TEST-A");
++    expect(kand.data.data[0].saknasIFacket).toBe(true);
++
++    // 3. Byt: A tillbaka i lager + hittat, B ut på ordern.
++    const byt = await api("POST", `/inventering/${sessionId}/byt-paket`, { pktNr: "TEST-A", ersattAvPktNr: "TEST-B" });
++    expect(byt.status).toBe(201);
++    expect(byt.data.order).toBe("Hyvelorder 9001");
++    expect(byt.data.klassificering).toBe("forvantad_hittad");
++    expect(byt.data.session.skanningar.map((s: { pktNr: string }) => s.pktNr)).toEqual(["TEST-A"]);
++
++    const [aEfter] = await db.select().from(lagerPosterTable).where(eq(lagerPosterTable.id, a.id));
++    const [bEfter] = await db.select().from(lagerPosterTable).where(eq(lagerPosterTable.id, b.id));
++    expect(aEfter.datumUt).toBeNull();
++    expect(aEfter.avrappTyp).toBeNull();
++    expect(bEfter.datumUt).toBe(idag);
++    expect(bEfter.avrappTyp).toBe("hyvlat_till_lager");
++
++    const orderRader = await db.select().from(specPaketTable).where(eq(specPaketTable.specId, spec.id));
++    expect(orderRader.map((r) => r.lagerPostId)).toEqual([b.id]);
++    expect(Number(orderRader[0].saljPris)).toBe(1000);
++    expect(Number(orderRader[0].saljSum)).toBeCloseTo(2400);
++
++    // 4. Ombytet kan inte göras två gånger.
++    const igen = await api("POST", `/inventering/${sessionId}/byt-paket`, { pktNr: "TEST-A", ersattAvPktNr: "TEST-B" });
++    expect(igen.status).toBe(409);
++    void c;
++  });
++
++  test("B får inte vara ett paket som redan skannats (då står det ju kvar)", async () => {
++    const { omrade, fack } = await skapaOmradeOchFack("TEST_OmbyteSkannat");
++    const a = await skapaPost(omrade.id, fack.id, "TEST-A2");
++    await skapaPost(omrade.id, fack.id, "TEST-B2");
++    await skapaBekraftadHyvelorder([a.id], 9002);
++    await db.update(lagerPosterTable).set({ datumUt: idag, avrappTyp: "hyvlat_till_lager" }).where(eq(lagerPosterTable.id, a.id));
++
++    const sessionId = await startaSession(omrade.id, fack.id);
++    await api("POST", `/inventering/${sessionId}/skanna`, { pktNr: "TEST-B2" });
++    const byt = await api("POST", `/inventering/${sessionId}/byt-paket`, { pktNr: "TEST-A2", ersattAvPktNr: "TEST-B2" });
++    expect(byt.status).toBe(409);
++    const [aEfter] = await db.select().from(lagerPosterTable).where(eq(lagerPosterTable.id, a.id));
++    expect(aEfter.datumUt).toBe(idag); // inget ändrades
++  });
++
++  test("avrapporterat utan order kan återinföras, men inte bytas", async () => {
++    const { omrade, fack } = await skapaOmradeOchFack("TEST_Aterinfor");
++    const a = await skapaPost(omrade.id, fack.id, "TEST-A3", { datumUt: idag });
++    await skapaPost(omrade.id, fack.id, "TEST-B3");
++
++    const sessionId = await startaSession(omrade.id, fack.id);
++    const skan = await api("POST", `/inventering/${sessionId}/skanna`, { pktNr: "TEST-A3" });
++    expect(skan.data.avrapporterad).toBe(true);
++    expect(skan.data.avrapportering.spec).toBeNull();
++    expect(skan.data.avrapportering.kanAterinforas).toBe(true);
++
++    const byt = await api("POST", `/inventering/${sessionId}/byt-paket`, { pktNr: "TEST-A3", ersattAvPktNr: "TEST-B3" });
++    expect(byt.status).toBe(409);
++
++    const ater = await api("POST", `/inventering/${sessionId}/aterinfor-avrapporterat`, { pktNr: "TEST-A3" });
++    expect(ater.status).toBe(201);
++    expect(ater.data.klassificering).toBe("forvantad_hittad");
++    const [aEfter] = await db.select().from(lagerPosterTable).where(and(eq(lagerPosterTable.id, a.id)));
++    expect(aEfter.datumUt).toBeNull();
++  });
++
++  test("vanliga paket och okända paket klassas som förut", async () => {
++    const { omrade, fack } = await skapaOmradeOchFack("TEST_Oforandrat");
++    await skapaPost(omrade.id, fack.id, "TEST-OK");
++    const sessionId = await startaSession(omrade.id, fack.id);
++    const ok = await api("POST", `/inventering/${sessionId}/skanna`, { pktNr: "TEST-OK" });
++    expect(ok.status).toBe(201);
++    expect(ok.data.klassificering).toBe("forvantad_hittad");
++    const okand = await api("POST", `/inventering/${sessionId}/skanna`, { pktNr: "TEST-FINNS-INTE" });
++    expect(okand.data.klassificering).toBe("okand");
++  });
++});
+diff --git a/artifacts/api-server/src/routes/__tests__/inventeringsomgangar.test.ts b/artifacts/api-server/src/routes/__tests__/inventeringsomgangar.test.ts
+index 1002539..7ec80e3 100644
+--- a/artifacts/api-server/src/routes/__tests__/inventeringsomgangar.test.ts
++++ b/artifacts/api-server/src/routes/__tests__/inventeringsomgangar.test.ts
+@@ -284,18 +284,27 @@ describe("Inventeringsomgångar — grundflöde", () => {
+ });
+ 
+ describe("Inventering — återinför historiskt mjukraderat paket", () => {
+-  test("levererad rad utan raderadAt förblir vanlig okänd skanning", async () => {
++  test("levererad rad utan raderadAt är avrapporterad: varnar utan att skanna eller ändra lagret", async () => {
++    // Tidigare klassades detta som en vanlig "okänd" skanning. Det dolde det
++    // vanliga fallet att ett paket avrapporterats på en order men ändå står
++    // kvar (ombyte). Nu returneras ett avrapporterat-svar; skanningen sparas
++    // först när användaren valt åtgärd (byt/återinför) — se
++    // inventeringAvrapporterat.test.ts.
+     const omrade = await skapaOmrade("TEST_LevereradOkand");
+     const fack = await skapaFack(omrade.id, "A1");
+     const post = await skapaPost({ omradeId: omrade.id, fackId: fack.id, pktNr: "P-LEVERERAD", antal: 1, m3: 0.2 });
+     await db.update(lagerPosterTable).set({ datumUt: "2026-01-01" }).where(eq(lagerPosterTable.id, post.id));
+     const sessionId = await startaSession(omrade.id, fack.id);
+-    const scanned = await api<{ deregistrerad?: boolean; klassificering: string }>("POST", `/inventering/${sessionId}/skanna`, {
++    const scanned = await api<{ deregistrerad?: boolean; avrapporterad?: boolean; klassificering: string }>("POST", `/inventering/${sessionId}/skanna`, {
+       body: { pktNr: "P-LEVERERAD" },
+     });
+-    expect(scanned.status).toBe(201);
+-    expect(scanned.data.klassificering).toBe("okand");
++    expect(scanned.status).toBe(200);
++    expect(scanned.data.avrapporterad).toBe(true);
+     expect(scanned.data.deregistrerad).not.toBe(true);
++    const [efter] = await db.select().from(lagerPosterTable).where(eq(lagerPosterTable.id, post.id));
++    expect(efter.datumUt).toBe("2026-01-01");
++    const oversikt = await api<{ skanningar: unknown[] }>("GET", `/inventering/${sessionId}`);
++    expect(oversikt.data.skanningar).toHaveLength(0);
+   });
+ 
+   test("identifierar utan mutation, återställer atomiskt och kan sedan skanna som vanligt", async () => {
+diff --git a/artifacts/api-server/src/routes/inventering.ts b/artifacts/api-server/src/routes/inventering.ts
+index 19a2bd2..98e8679 100644
+--- a/artifacts/api-server/src/routes/inventering.ts
++++ b/artifacts/api-server/src/routes/inventering.ts
+@@ -14,9 +14,12 @@ import {
+   lagerInventeringsomgangFackTable,
+   lagerInventeringsomgangGlobalSnapshotTable,
+   lagerInventeringsomgangKorrigeringarTable,
++  lagerInventeringsomgangSaknatBeslutTable,
+   lagerHistorikTable,
++  specPaketTable,
++  specifikationerTable,
+ } from "@workspace/db";
+-import { and, eq, inArray, desc, ne, lt, lte, sql } from "drizzle-orm";
++import { and, eq, inArray, desc, ne, lt, lte, sql, isNull, isNotNull } from "drizzle-orm";
+ import { iLagerConditions, hamtaAktuellaPaketRader, buildLagerSearchConditions } from "../lib/lagerFilters";
+ import { applyLagerPatch } from "./lager";
+ 
+@@ -107,6 +110,135 @@ function klassificeraRader(
+   return "felplacerad";
+ }
+ 
++// --- Avrapporterade paket funna vid inventering ------------------------
++//
++// Typiskt fall: en hyvelorder (spec) bekräftas med paket A → A får datumUt
++// och lämnar "aktuellt lager". I verkligheten plockas ett annat paket B
++// (A står längst in) utan att ordern ändras. Vid inventeringen hittas då A
++// fysiskt (avrapporterat i systemet) medan B saknas (finns kvar i systemet).
++// Ett avrapporterat paket (datumUt satt, ej mjukraderat) får därför inte
++// längre klassas som "okänt" — användaren ska få veta vilken order det
++// sitter på och kunna rätta ordern (byta A mot B) eller återinföra A.
++type LagerRad = typeof lagerPosterTable.$inferSelect;
++
++async function hamtaAvrapporteradeRader(tx: InventeringTx | typeof db, pktNr: string): Promise<LagerRad[]> {
++  return tx
++    .select()
++    .from(lagerPosterTable)
++    .where(
++      and(
++        eq(lagerPosterTable.pktNr, pktNr),
++        isNull(lagerPosterTable.raderadAt),
++        isNotNull(lagerPosterTable.datumUt),
++        sql`(${lagerPosterTable.avrappTyp} IS NULL OR ${lagerPosterTable.avrappTyp} <> 'spec_import')`,
++      ),
++    );
++}
++
++const SPEC_TYP_LABEL: Record<string, string> = {
++  hyvling: "Hyvelorder",
++  leverans: "Leveransspec",
++  impregnering: "Behandlingsorder",
++};
++
++type SpecKoppling = {
++  id: number;
++  typ: string;
++  etikett: string; // t.ex. "Hyvelorder 123"
++  nr: number | null;
++  kund: string | null;
++  orderNr: string | null;
++  bekraftadAt: string | null;
++};
++
++// Vilken bekräftad spec/order som innehåller (någon av) lagerraderna.
++async function hamtaSpecKoppling(tx: InventeringTx | typeof db, lagerIds: number[]) {
++  if (lagerIds.length === 0) return { spec: null as SpecKoppling | null, specPaket: [] as (typeof specPaketTable.$inferSelect)[] };
++  const specPaket = await tx.select().from(specPaketTable).where(inArray(specPaketTable.lagerPostId, lagerIds));
++  if (specPaket.length === 0) return { spec: null, specPaket: [] };
++  const specs = await tx
++    .select()
++    .from(specifikationerTable)
++    .where(inArray(specifikationerTable.id, Array.from(new Set(specPaket.map((sp) => sp.specId)))));
++  const bekraftade = specs.filter((sp) => sp.status === "bekraftad").sort((a, b) => b.id - a.id);
++  const valdSpec = bekraftade[0];
++  if (!valdSpec) return { spec: null, specPaket: [] };
++  const nr = valdSpec.typ === "hyvling" ? valdSpec.hyvlingNr : valdSpec.specNr;
++  return {
++    spec: {
++      id: valdSpec.id,
++      typ: valdSpec.typ,
++      etikett: `${SPEC_TYP_LABEL[valdSpec.typ] ?? "Order"} ${nr ?? valdSpec.id}`,
++      nr: nr ?? null,
++      kund: valdSpec.kund ?? null,
++      orderNr: valdSpec.orderNr ?? null,
++      bekraftadAt: valdSpec.bekraftadAt ? valdSpec.bekraftadAt.toISOString() : null,
++    } satisfies SpecKoppling,
++    specPaket: specPaket.filter((sp) => sp.specId === valdSpec.id),
++  };
++}
++
++async function beskrivAvrapportering(tx: InventeringTx | typeof db, rader: LagerRad[]) {
++  const { spec } = await hamtaSpecKoppling(tx, rader.map((r) => r.id));
++  const datumUt = rader.map((r) => r.datumUt).filter((d): d is string => !!d).sort().pop() ?? null;
++  return {
++    datumUt,
++    avrappTyp: rader[0]?.avrappTyp ?? null,
++    spec,
++    // Utan koppling till en bekräftad order finns inget att "byta" — då kan
++    // paketet bara återinföras i lager.
++    kanByta: spec !== null,
++    kanAterinforas: spec === null,
++  };
++}
++
++// Skriver en skanning (+ frysta rader) för ett pktNr. Delas av vanlig
++// skanning och av "byt paket"/"återinför" som skannar in paketet i samma
++// transaktion som lagerrättelsen.
++async function registreraSkanning(
++  tx: InventeringTx,
++  session: typeof lagerInventeringarTable.$inferSelect,
++  pktNr: string,
++  metod: string,
++  userId: string,
++  rader: LagerRad[],
++) {
++  const klassificering = klassificeraRader(rader, session.omradeId, session.fackId);
++  const [skanning] = await tx
++    .insert(lagerInventeringSkanningarTable)
++    .values({
++      inventeringId: session.id,
++      pktNrSkannat: pktNr,
++      klassificering,
++      metod,
++      skannadAv: userId,
++      frystUtanRader: rader.length === 0,
++    })
++    .returning();
++
++  if (rader.length > 0) {
++    await tx.insert(lagerInventeringSkanningRaderTable).values(
++      rader.map((r) => ({
++        skanningId: skanning.id,
++        lagerId: r.id,
++        omradeIdVidSkanning: r.omradeId,
++        fackIdVidSkanning: r.fackId,
++        traslagVidSkanning: r.traslag,
++        profilVidSkanning: r.profil,
++        kvalitetVidSkanning: r.kvalitet,
++        nomTjocklekVidSkanning: r.nomTjocklek,
++        nomBreddVidSkanning: r.nomBredd,
++        actTjocklekVidSkanning: r.actTjocklek,
++        actBreddVidSkanning: r.actBredd,
++        langdDmVidSkanning: r.langdDm,
++        antalVidSkanning: r.antal,
++        nomM3VidSkanning: r.m3,
++      })),
++    );
++  }
++  return { skanning, klassificering };
++}
++
+ export async function hamtaSession(id: number) {
+   const [session] = await db.select().from(lagerInventeringarTable).where(eq(lagerInventeringarTable.id, id));
+   return session ?? null;
+@@ -1481,7 +1613,7 @@ router.get("/sok-paket", async (req, res) => {
+   const aktivaPktNr = new Set(komplettaAktuella.map((r) => r.pktNr));
+   const historiskaPktNr = new Set(
+     komplettaHistoriska
+-      .filter((r) => r.raderadAt !== null && !aktivaPktNr.has(r.pktNr))
++      .filter((r) => (r.raderadAt !== null || (r.datumUt !== null && r.avrappTyp !== "spec_import")) && !aktivaPktNr.has(r.pktNr))
+       .map((r) => r.pktNr),
+   );
+   const historiskaRader = komplettaHistoriska.filter((r) => historiskaPktNr.has(r.pktNr));
+@@ -1520,6 +1652,7 @@ router.get("/sok-paket", async (req, res) => {
+       const fackIdSet = new Set(rows.map((r) => r.fackId ?? null));
+       const harMjukraderadRad = rows.some((r) => r.raderadAt !== null);
+       const deregistrerad = harMjukraderadRad;
++      const avrapporterad = !deregistrerad && rows.every((r) => r.datumUt !== null);
+       const kanAterstallas = deregistrerad && rows.every((r) => r.raderadAt !== null && r.datumUt === null);
+       return {
+         pktNr,
+@@ -1552,6 +1685,7 @@ router.get("/sok-paket", async (req, res) => {
+             : "ej_aterstallningsbar"
+           : "ej_aterstallningsbar",
+         deregistrerad,
++        avrapporterad,
+         kanAterstallas,
+         restaureringsAnledning: deregistrerad && !kanAterstallas
+           ? "Historiska rader har datumUt eller ett annat tillstånd som inte kan återställas säkert"
+@@ -1697,39 +1831,18 @@ router.post("/:id/skanna", async (req, res) => {
+         };
+       }
+     }
+-    const klassificering = klassificeraRader(rader, session.omradeId, session.fackId);
+-    const [skanning] = await tx
+-      .insert(lagerInventeringSkanningarTable)
+-      .values({
+-        inventeringId: id,
+-        pktNrSkannat: pktNr,
+-        klassificering,
+-        metod,
+-        skannadAv: req.userId,
+-        frystUtanRader: rader.length === 0,
+-      })
+-      .returning();
+-
+-    if (rader.length > 0) {
+-      await tx.insert(lagerInventeringSkanningRaderTable).values(
+-        rader.map((r) => ({
+-          skanningId: skanning.id,
+-          lagerId: r.id,
+-          omradeIdVidSkanning: r.omradeId,
+-          fackIdVidSkanning: r.fackId,
+-          traslagVidSkanning: r.traslag,
+-          profilVidSkanning: r.profil,
+-          kvalitetVidSkanning: r.kvalitet,
+-          nomTjocklekVidSkanning: r.nomTjocklek,
+-          nomBreddVidSkanning: r.nomBredd,
+-          actTjocklekVidSkanning: r.actTjocklek,
+-          actBreddVidSkanning: r.actBredd,
+-          langdDmVidSkanning: r.langdDm,
+-          antalVidSkanning: r.antal,
+-          nomM3VidSkanning: r.m3,
+-        })),
+-      );
++    if (rader.length === 0) {
++      const avrapporterade = await hamtaAvrapporteradeRader(tx, pktNr);
++      if (avrapporterade.length > 0) {
++        return {
++          kind: "avrapporterad" as const,
++          session,
++          avrapportering: await beskrivAvrapportering(tx, avrapporterade),
++          rader: avrapporterade,
++        };
++      }
+     }
++    const klassificering = (await registreraSkanning(tx, session, pktNr, metod, req.userId, rader)).klassificering;
+ 
+     return { kind: "skapad" as const, session, klassificering };
+   });
+@@ -1742,6 +1855,20 @@ router.post("/:id/skanna", async (req, res) => {
+     res.status(400).json({ error: "Sessionen är inte pågående" });
+     return;
+   }
++  if (resultat.value.kind === "avrapporterad") {
++    // Ren läsning: ingen skanning sparas förrän användaren valt hur
++    // avvikelsen ska hanteras (byt mot annat paket / återinför).
++    res.status(200).json({
++      redanSkannad: false,
++      avrapporterad: true,
++      klassificering: "avrapporterad",
++      status: "avrapporterad",
++      pktNr,
++      avrapportering: resultat.value.avrapportering,
++      package: sammanstallPaketDetaljer(resultat.value.rader),
++    });
++    return;
++  }
+   if (resultat.value.kind === "deregistrerad") {
+     const detaljer = sammanstallPaketDetaljer(resultat.value.rader);
+     res.status(200).json({
+@@ -1981,6 +2108,357 @@ router.post("/:id/korrigera", async (req, res) => {
+   res.json({ korrigerade: resultat.value.korrigerade, konflikter: resultat.value.konflikter });
+ });
+ 
++// Förslag på vilket paket som i själva verket plockades i stället för det
++// avrapporterade paketet `pktNr` (som hittades kvar i lagret). Rankas på
++// samma mått/profil/kvalitet, samt om paketet "saknas" i det här facket
++// (förväntat men ännu inte skannat). Ren läsning.
++router.get("/:id/byte-kandidater", async (req, res) => {
++  const id = Number(req.params.id);
++  const pktNr = String(req.query.pktNr ?? "").trim();
++  const session = await hamtaSession(id);
++  if (!session) {
++    res.status(404).json({ error: "Sessionen hittades inte" });
++    return;
++  }
++  if (!pktNr) {
++    res.status(400).json({ error: "pktNr krävs" });
++    return;
++  }
++
++  const aRader = await hamtaAvrapporteradeRader(db, pktNr);
++  if (aRader.length === 0) {
++    res.json({ data: [] });
++    return;
++  }
++  const a = aRader[0];
++  const aTjocklek = toNumber(a.nomTjocklek);
++  const aBredd = toNumber(a.nomBredd);
++
++  const [skannade, forvantade] = await Promise.all([
++    db
++      .select({ pktNr: lagerInventeringSkanningarTable.pktNrSkannat })
++      .from(lagerInventeringSkanningarTable)
++      .where(eq(lagerInventeringSkanningarTable.inventeringId, id)),
++    db
++      .select({ pktNr: lagerInventeringForvantadeTable.pktNr })
++      .from(lagerInventeringForvantadeTable)
++      .where(eq(lagerInventeringForvantadeTable.inventeringId, id)),
++  ]);
++  const skannadeSet = new Set(skannade.map((x) => x.pktNr));
++  const saknasIFack = new Set(forvantade.map((x) => x.pktNr).filter((p) => !skannadeSet.has(p)));
++
++  // Kandidater = aktuella paket med samma nominella mått (annars samma fack).
++  const matchVillkor =
++    aTjocklek > 0 && aBredd > 0
++      ? and(
++          sql`${lagerPosterTable.nomTjocklek}::numeric = ${aTjocklek}`,
++          sql`${lagerPosterTable.nomBredd}::numeric = ${aBredd}`,
++        )
++      : and(eq(lagerPosterTable.omradeId, session.omradeId), eq(lagerPosterTable.fackId, session.fackId));
++  const kandidatRader = await db
++    .select()
++    .from(lagerPosterTable)
++    .where(and(matchVillkor, ...iLagerConditions()))
++    .limit(1500);
++
++  const grupper = new Map<string, LagerRad[]>();
++  for (const r of kandidatRader) {
++    if (!r.pktNr || r.pktNr === pktNr || skannadeSet.has(r.pktNr)) continue;
++    const arr = grupper.get(r.pktNr) ?? [];
++    arr.push(r);
++    grupper.set(r.pktNr, arr);
++  }
++
++  const aLangder = new Set(aRader.map((r) => toNumber(r.langdDm)).filter((v) => v > 0));
++  const poangade = Array.from(grupper.entries()).map(([kPktNr, rows]) => {
++    const first = rows[0];
++    const orsaker: string[] = [];
++    let poang = 0;
++    if (saknasIFack.has(kPktNr)) { poang += 6; orsaker.push("Saknas i facket"); }
++    if (first.omradeId === session.omradeId && first.fackId === session.fackId) { poang += 3; orsaker.push("Samma fack"); }
++    else if (first.omradeId === session.omradeId) { poang += 1; orsaker.push("Samma område"); }
++    if ((first.traslag ?? "") === (a.traslag ?? "")) poang += 2; else poang -= 2;
++    if ((first.profil ?? "") === (a.profil ?? "")) { poang += 2; if (first.profil) orsaker.push("Samma profil"); }
++    if ((first.kvalitet ?? "") === (a.kvalitet ?? "")) { poang += 1; if (first.kvalitet) orsaker.push("Samma kvalitet"); }
++    const langder = Array.from(new Set(rows.map((r) => toNumber(r.langdDm)).filter((v) => v > 0))).sort((x, y) => x - y);
++    if (langder.length > 0 && langder.every((l) => aLangder.has(l))) { poang += 2; orsaker.push("Samma längd"); }
++    return { kPktNr, rows, first, langder, orsaker, poang };
++  });
++  poangade.sort((x, y) => y.poang - x.poang || x.kPktNr.localeCompare(y.kPktNr, "sv", { numeric: true }));
++
++  const topp = poangade.slice(0, 12);
++  const omradeIds = Array.from(new Set(topp.map((k) => k.first.omradeId).filter((v): v is number => v != null)));
++  const fackIds = Array.from(new Set(topp.map((k) => k.first.fackId).filter((v): v is number => v != null)));
++  const [omraden, fackRader] = await Promise.all([
++    omradeIds.length ? db.select().from(lagerOmradenTable).where(inArray(lagerOmradenTable.id, omradeIds)) : Promise.resolve([]),
++    fackIds.length ? db.select().from(lagerFackTable).where(inArray(lagerFackTable.id, fackIds)) : Promise.resolve([]),
++  ]);
++  const omradeMap = new Map(omraden.map((o) => [o.id, o]));
++  const fackMap = new Map(fackRader.map((f) => [f.id, f]));
++
++  res.json({
++    data: topp.map((k) => ({
++      pktNr: k.kPktNr,
++      traslag: k.first.traslag,
++      profil: k.first.profil,
++      kvalitet: k.first.kvalitet,
++      nomTjocklek: toNumber(k.first.nomTjocklek) || null,
++      nomBredd: toNumber(k.first.nomBredd) || null,
++      langder: k.langder,
++      totalAntal: k.rows.reduce((sum, r) => sum + toNumber(r.antal), 0),
++      totalM3: round2(k.rows.reduce((sum, r) => sum + toNumber(r.m3), 0)),
++      omradeNamn: k.first.omradeId != null ? (omradeMap.get(k.first.omradeId)?.namn ?? null) : null,
++      fackKod: k.first.fackId != null ? (fackMap.get(k.first.fackId)?.kod ?? null) : null,
++      saknasIFacket: saknasIFack.has(k.kPktNr),
++      orsaker: k.orsaker,
++    })),
++  });
++});
++
++// Ombyte på order: paket A (avrapporterat på en bekräftad order men
++// fysiskt kvar i lagret) byts mot paket B (som i själva verket plockades).
++// ALLT sker i en transaktion:
++//   - A återinförs i lager (datumUt/avrappTyp nollas) och skannas in
++//   - B avrapporteras med ordens datum/typ
++//   - ordens paketrad byts från A till B (pris per m³ följer med)
++//   - lagerhistorik skrivs för båda paketen
++//   - om sessionen ingår i en omgång loggas B som "avrapporterad" bland
++//     omgångens saknade, så att rapporten visar varför B inte hittades
++router.post("/:id/byt-paket", async (req, res) => {
++  const id = Number(req.params.id);
++  const pktNr = String(req.body?.pktNr ?? "").trim();
++  const ersattAvPktNr = String(req.body?.ersattAvPktNr ?? "").trim();
++  const metod = String(req.body?.metod ?? "skanner");
++  if (!pktNr || !ersattAvPktNr) {
++    res.status(400).json({ error: "pktNr och ersattAvPktNr krävs" });
++    return;
++  }
++  if (pktNr === ersattAvPktNr) {
++    res.status(400).json({ error: "Paketen måste vara olika" });
++    return;
++  }
++  if (!["skanner", "kamera", "manuell"].includes(metod)) {
++    res.status(400).json({ error: "Ogiltig metod" });
++    return;
++  }
++
++  const resultat = await medLastOmgångForSessionsmutation(id, async (tx, session) => {
++    if (session.status !== "pagaende") return { kind: "session_stangd" as const };
++    for (const p of [pktNr, ersattAvPktNr].sort()) {
++      await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${`pkt:${p}`}, 0))`);
++    }
++
++    const aRader = await tx
++      .select()
++      .from(lagerPosterTable)
++      .where(and(eq(lagerPosterTable.pktNr, pktNr), isNull(lagerPosterTable.raderadAt)))
++      .for("update");
++    const aAvrapporterade = aRader.filter((r) => r.datumUt !== null && r.avrappTyp !== "spec_import");
++    if (aAvrapporterade.length === 0 || aAvrapporterade.length !== aRader.length) {
++      return { kind: "konflikt" as const, error: `Paket ${pktNr} är inte längre avrapporterat` };
++    }
++    const bRader = await tx
++      .select()
++      .from(lagerPosterTable)
++      .where(and(eq(lagerPosterTable.pktNr, ersattAvPktNr), ...iLagerConditions()))
++      .for("update");
++    if (bRader.length === 0) {
++      return { kind: "konflikt" as const, error: `Paket ${ersattAvPktNr} finns inte som aktuellt lagerpaket` };
++    }
++
++    const [redanSkannadA] = await tx
++      .select({ id: lagerInventeringSkanningarTable.id })
++      .from(lagerInventeringSkanningarTable)
++      .where(and(eq(lagerInventeringSkanningarTable.inventeringId, id), eq(lagerInventeringSkanningarTable.pktNrSkannat, pktNr)));
++    if (redanSkannadA) return { kind: "konflikt" as const, error: `Paket ${pktNr} är redan skannat i den här inventeringen` };
++    const [redanSkannadB] = await tx
++      .select({ id: lagerInventeringSkanningarTable.id })
++      .from(lagerInventeringSkanningarTable)
++      .where(and(eq(lagerInventeringSkanningarTable.inventeringId, id), eq(lagerInventeringSkanningarTable.pktNrSkannat, ersattAvPktNr)));
++    if (redanSkannadB) {
++      return { kind: "konflikt" as const, error: `Paket ${ersattAvPktNr} är redan skannat i den här inventeringen, alltså finns det kvar och kan inte vara det som plockades` };
++    }
++
++    const { spec, specPaket } = await hamtaSpecKoppling(tx, aAvrapporterade.map((r) => r.id));
++    if (!spec || specPaket.length === 0) {
++      return { kind: "konflikt" as const, error: `Paket ${pktNr} sitter inte på någon bekräftad order — använd "Återinför i lager"` };
++    }
++    const bPaIOrdern = await tx
++      .select({ id: specPaketTable.id })
++      .from(specPaketTable)
++      .where(and(eq(specPaketTable.specId, spec.id), inArray(specPaketTable.lagerPostId, bRader.map((r) => r.id))));
++    if (bPaIOrdern.length > 0) {
++      return { kind: "konflikt" as const, error: `Paket ${ersattAvPktNr} ligger redan på ${spec.etikett}` };
++    }
++
++    const datumUt = aAvrapporterade.map((r) => r.datumUt!).sort().pop()!;
++    const avrappTyp = aAvrapporterade[0].avrappTyp;
++    const nu = new Date();
++
++    // 1. A tillbaka i lager.
++    const aNya = await tx
++      .update(lagerPosterTable)
++      .set({ datumUt: null, avrappTyp: null, uppdateradAt: nu })
++      .where(inArray(lagerPosterTable.id, aAvrapporterade.map((r) => r.id)))
++      .returning();
++    // 2. B ut på ordern.
++    await tx
++      .update(lagerPosterTable)
++      .set({ datumUt, avrappTyp, uppdateradAt: nu })
++      .where(inArray(lagerPosterTable.id, bRader.map((r) => r.id)));
++
++    // 3. Ordens paketrader: ta bort A, lägg till B (pris per m³ följer med).
++    const referens = specPaket[0];
++    await tx
++      .delete(specPaketTable)
++      .where(and(eq(specPaketTable.specId, spec.id), inArray(specPaketTable.lagerPostId, aAvrapporterade.map((r) => r.id))));
++    const prisPerM3 = referens.saljPris !== null && referens.saljPris !== undefined ? Number(referens.saljPris) : null;
++    await tx.insert(specPaketTable).values(
++      bRader.map((r) => ({
++        specId: spec.id,
++        lagerPostId: r.id,
++        saljPris: prisPerM3 !== null && !Number.isNaN(prisPerM3) ? String(prisPerM3) : null,
++        saljSum:
++          prisPerM3 !== null && !Number.isNaN(prisPerM3) && r.m3 !== null
++            ? (prisPerM3 * toNumber(r.m3)).toFixed(2)
++            : null,
++        ntrKlass: referens.ntrKlass,
++      })),
++    );
++
++    // 4. Historik.
++    await tx.insert(lagerHistorikTable).values([
++      ...aNya.map((r) => ({
++        lagerId: r.id,
++        action: "inventering_ombyte_tillbaka_i_lager",
++        changedBy: req.userId,
++        andringar: JSON.stringify({ inventeringId: id, specId: spec.id, ersattAv: ersattAvPktNr, datumUt: null }),
++      })),
++      ...bRader.map((r) => ({
++        lagerId: r.id,
++        action: "inventering_ombyte_avrapporterad",
++        changedBy: req.userId,
++        andringar: JSON.stringify({ inventeringId: id, specId: spec.id, ersatter: pktNr, datumUt }),
++      })),
++    ]);
++
++    // 5. Logga B bland omgångens saknade (granskningslogg, påverkar inga siffror).
++    if (session.omgangId !== null) {
++      const kommentar = `Ombyte på ${spec.etikett}: paket ${pktNr} hittades kvar i lagret och byttes mot ${ersattAvPktNr}`;
++      await tx
++        .insert(lagerInventeringsomgangSaknatBeslutTable)
++        .values({ omgangId: session.omgangId, pktNr: ersattAvPktNr, beslut: "avrapporterad", kommentar, beslutadAv: req.userId })
++        .onConflictDoUpdate({
++          target: [lagerInventeringsomgangSaknatBeslutTable.omgangId, lagerInventeringsomgangSaknatBeslutTable.pktNr],
++          set: { beslut: "avrapporterad", kommentar, beslutadAv: req.userId, beslutadAt: new Date() },
++        });
++    }
++
++    // 6. Skanna in A (nu aktuellt) i sessionen.
++    const { klassificering } = await registreraSkanning(tx, session, pktNr, metod, req.userId, aNya);
++    return { kind: "ok" as const, session, klassificering, spec };
++  });
++
++  if (!resultat.ok) {
++    res.status(resultat.status).json({ error: resultat.error });
++    return;
++  }
++  const v = resultat.value;
++  if (v.kind === "session_stangd") {
++    res.status(400).json({ error: "Sessionen är inte pågående" });
++    return;
++  }
++  if (v.kind === "konflikt") {
++    res.status(409).json({ error: v.error });
++    return;
++  }
++  res.status(201).json({
++    bytt: true,
++    pktNr,
++    ersattAvPktNr,
++    order: v.spec.etikett,
++    klassificering: v.klassificering,
++    session: await byggSessionsoversikt(v.session),
++  });
++});
++
++// Återinför ett avrapporterat paket som hittades fysiskt kvar och som INTE
++// sitter på någon bekräftad order (t.ex. manuellt avrapporterat som saknat
++// vid en tidigare inventering). Nollar datumUt/avrappTyp och skannar in det.
++router.post("/:id/aterinfor-avrapporterat", async (req, res) => {
++  const id = Number(req.params.id);
++  const pktNr = String(req.body?.pktNr ?? "").trim();
++  const metod = String(req.body?.metod ?? "skanner");
++  if (!pktNr) {
++    res.status(400).json({ error: "pktNr krävs" });
++    return;
++  }
++  if (!["skanner", "kamera", "manuell"].includes(metod)) {
++    res.status(400).json({ error: "Ogiltig metod" });
++    return;
++  }
++
++  const resultat = await medLastOmgångForSessionsmutation(id, async (tx, session) => {
++    if (session.status !== "pagaende") return { kind: "session_stangd" as const };
++    await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${`pkt:${pktNr}`}, 0))`);
++    const rader = await tx
++      .select()
++      .from(lagerPosterTable)
++      .where(and(eq(lagerPosterTable.pktNr, pktNr), isNull(lagerPosterTable.raderadAt)))
++      .for("update");
++    const avrapporterade = rader.filter((r) => r.datumUt !== null && r.avrappTyp !== "spec_import");
++    if (avrapporterade.length === 0 || avrapporterade.length !== rader.length) {
++      return { kind: "konflikt" as const, error: `Paket ${pktNr} är inte längre avrapporterat` };
++    }
++    const { spec } = await hamtaSpecKoppling(tx, avrapporterade.map((r) => r.id));
++    if (spec) {
++      return { kind: "konflikt" as const, error: `Paket ${pktNr} sitter på ${spec.etikett} — byt mot det paket som plockades i stället` };
++    }
++    const [redan] = await tx
++      .select({ id: lagerInventeringSkanningarTable.id })
++      .from(lagerInventeringSkanningarTable)
++      .where(and(eq(lagerInventeringSkanningarTable.inventeringId, id), eq(lagerInventeringSkanningarTable.pktNrSkannat, pktNr)));
++    if (redan) return { kind: "konflikt" as const, error: `Paket ${pktNr} är redan skannat i den här inventeringen` };
++
++    const nya = await tx
++      .update(lagerPosterTable)
++      .set({ datumUt: null, avrappTyp: null, uppdateradAt: new Date() })
++      .where(inArray(lagerPosterTable.id, avrapporterade.map((r) => r.id)))
++      .returning();
++    await tx.insert(lagerHistorikTable).values(
++      nya.map((r) => ({
++        lagerId: r.id,
++        action: "inventering_aterinford_avrapporterat",
++        changedBy: req.userId,
++        andringar: JSON.stringify({ inventeringId: id, datumUt: null }),
++      })),
++    );
++    const { klassificering } = await registreraSkanning(tx, session, pktNr, metod, req.userId, nya);
++    return { kind: "ok" as const, session, klassificering };
++  });
++
++  if (!resultat.ok) {
++    res.status(resultat.status).json({ error: resultat.error });
++    return;
++  }
++  const v = resultat.value;
++  if (v.kind === "session_stangd") {
++    res.status(400).json({ error: "Sessionen är inte pågående" });
++    return;
++  }
++  if (v.kind === "konflikt") {
++    res.status(409).json({ error: v.error });
++    return;
++  }
++  res.status(201).json({
++    aterinford: true,
++    pktNr,
++    klassificering: v.klassificering,
++    session: await byggSessionsoversikt(v.session),
++  });
++});
++
++
+ // Detaljerade rapportrader (en per skannat pktNr) för utskrift/export —
+ // driver både "Inventeringslista utan priser" och "Värderad
+ // inventeringslista". En avslutad (eller pågående) inventering ska vara en
+diff --git a/artifacts/lager/src/pages/inventering/AvrapporteratPaketDialog.tsx b/artifacts/lager/src/pages/inventering/AvrapporteratPaketDialog.tsx
+new file mode 100644
+index 0000000..f5a2b98
+--- /dev/null
++++ b/artifacts/lager/src/pages/inventering/AvrapporteratPaketDialog.tsx
+@@ -0,0 +1,255 @@
++import { useEffect, useState } from "react";
++import { useQuery } from "@tanstack/react-query";
++import { customFetch } from "@workspace/api-client-react";
++import { Button } from "@/components/ui/button";
++import { Badge } from "@/components/ui/badge";
++import {
++  Dialog,
++  DialogContent,
++  DialogDescription,
++  DialogFooter,
++  DialogHeader,
++  DialogTitle,
++} from "@/components/ui/dialog";
++import { cn } from "@/lib/utils";
++import { AlertTriangle, ArrowLeftRight, CheckCircle2, Loader2, Search } from "lucide-react";
++import { useDebounce } from "@/hooks/use-debounce";
++
++// Ett paket som skannas men som är AVRAPPORTERAT (utlevererat/hyvlat på en
++// order) men ändå står kvar i lagret. Vanligaste orsaken: ordern skrevs med
++// paket A, men ett annat paket B plockades (A stod längst in) utan att ordern
++// ändrades. Dialogen låter användaren peka ut paketet B som plockades i
++// stället, och rättar sedan order + lager i ett steg.
++
++export type AvrapporteratPaket = {
++  pktNr: string;
++  metod: "skanner" | "manuell" | "kamera";
++  avrapportering: {
++    datumUt: string | null;
++    avrappTyp: string | null;
++    spec: { id: number; typ: string; etikett: string; kund: string | null; orderNr: string | null } | null;
++    kanByta: boolean;
++    kanAterinforas: boolean;
++  };
++  package: {
++    traslag: string | null;
++    profil: string | null;
++    kvalitet: string | null;
++    nomTjocklek: string | null;
++    nomBredd: string | null;
++    langder: number[];
++    styck: number;
++    nomM3: number;
++  };
++};
++
++type Kandidat = {
++  pktNr: string;
++  traslag: string | null;
++  profil: string | null;
++  kvalitet: string | null;
++  nomTjocklek: number | null;
++  nomBredd: number | null;
++  langder: number[];
++  totalAntal: number;
++  totalM3: number;
++  omradeNamn: string | null;
++  fackKod: string | null;
++  saknasIFacket: boolean;
++  orsaker: string[];
++};
++
++type SokTraff = Pick<Kandidat, "pktNr" | "traslag" | "profil" | "kvalitet" | "nomTjocklek" | "nomBredd" | "langder" | "totalAntal" | "totalM3" | "omradeNamn" | "fackKod"> & {
++  deregistrerad?: boolean;
++  avrapporterad?: boolean;
++};
++
++interface Props {
++  sessionId: string;
++  paket: AvrapporteratPaket | null;
++  arbetar: boolean;
++  onByt: (ersattAvPktNr: string) => void;
++  onAterinfor: () => void;
++  onStang: () => void;
++}
++
++function beskriv(k: Pick<Kandidat, "traslag" | "profil" | "kvalitet" | "nomTjocklek" | "nomBredd" | "langder">) {
++  const dim = k.nomTjocklek || k.nomBredd ? `${k.nomTjocklek ?? "-"}×${k.nomBredd ?? "-"}` : null;
++  return [k.traslag, dim, k.langder.length ? `${k.langder.join("+")} dm` : null, k.profil, k.kvalitet]
++    .filter(Boolean)
++    .join(" · ");
++}
++
++export default function AvrapporteratPaketDialog({ sessionId, paket, arbetar, onByt, onAterinfor, onStang }: Props) {
++  const [vald, setVald] = useState<string | null>(null);
++  const [sokText, setSokText] = useState("");
++  const debounced = useDebounce(sokText.trim(), 250);
++
++  useEffect(() => {
++    setVald(null);
++    setSokText("");
++  }, [paket?.pktNr]);
++
++  const kanByta = paket?.avrapportering.kanByta ?? false;
++
++  const { data: kandData, isLoading: kandLaddar } = useQuery<{ data: Kandidat[] }>({
++    queryKey: ["/api/inventering/byte-kandidater", sessionId, paket?.pktNr],
++    queryFn: () =>
++      customFetch<{ data: Kandidat[] }>(
++        `/api/inventering/${sessionId}/byte-kandidater?pktNr=${encodeURIComponent(paket!.pktNr)}`,
++      ),
++    enabled: !!paket && kanByta,
++  });
++  const { data: sokData, isFetching: sokLaddar } = useQuery<{ data: SokTraff[] }>({
++    queryKey: ["/api/inventering/sok-paket", "byte", debounced],
++    queryFn: () => customFetch<{ data: SokTraff[] }>(`/api/inventering/sok-paket?q=${encodeURIComponent(debounced)}`),
++    enabled: !!paket && kanByta && debounced.length >= 2,
++  });
++
++  if (!paket) return null;
++  const { avrapportering, package: p } = paket;
++  const spec = avrapportering.spec;
++  const kandidater = kandData?.data ?? [];
++  const sokTraffar = (sokData?.data ?? []).filter((t) => t.pktNr !== paket.pktNr && !t.deregistrerad && !t.avrapporterad);
++  const visaSok = debounced.length >= 2;
++  const lista: (Kandidat | SokTraff)[] = visaSok ? sokTraffar : kandidater;
++
++  return (
++    <Dialog open onOpenChange={(open) => { if (!open && !arbetar) onStang(); }}>
++      <DialogContent className="max-w-lg max-h-[92vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
++        <DialogHeader>
++          <DialogTitle className="flex items-center gap-2">
++            <AlertTriangle className="h-5 w-5 text-amber-600 shrink-0" />
++            Paket {paket.pktNr} är avrapporterat
++          </DialogTitle>
++          <DialogDescription>
++            {spec
++              ? <>Systemet tror att paketet lämnade lagret på <strong>{spec.etikett}</strong>
++                  {avrapportering.datumUt ? ` (${avrapportering.datumUt})` : ""}
++                  {spec.kund ? ` · ${spec.kund}` : ""}, men det står kvar här.</>
++              : <>Systemet tror att paketet har lämnat lagret{avrapportering.datumUt ? ` (${avrapportering.datumUt})` : ""}, men det står kvar här.</>}
++          </DialogDescription>
++        </DialogHeader>
++
++        <div className="rounded-md border bg-muted/30 p-3 text-sm">
++          <div className="font-mono font-medium">{paket.pktNr}</div>
++          <div className="text-muted-foreground">
++            {beskriv({
++              traslag: p.traslag,
++              profil: p.profil,
++              kvalitet: p.kvalitet,
++              nomTjocklek: p.nomTjocklek ? Number(p.nomTjocklek) : null,
++              nomBredd: p.nomBredd ? Number(p.nomBredd) : null,
++              langder: p.langder,
++            }) || "—"}
++          </div>
++          <div className="text-muted-foreground">{p.styck} st · {p.nomM3.toFixed(2)} m³</div>
++        </div>
++
++        {kanByta && (
++          <div className="space-y-3">
++            <p className="text-sm font-medium">
++              Vilket paket plockade du i stället för {paket.pktNr}?
++            </p>
++            <p className="text-xs text-muted-foreground -mt-2">
++              Välj det paket som egentligen gick till ordern. Ordern och lagret rättas då så att båda stämmer.
++            </p>
++
++            <div className="relative">
++              <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
++              <input
++                value={sokText}
++                onChange={(e) => setSokText(e.target.value)}
++                placeholder="Sök annat paket (paketnr, mått, träslag…)"
++                className="w-full rounded-md border bg-background pl-8 pr-3 py-2 text-sm outline-none focus:ring-2 focus:ring-[#2d5a27]/40"
++                autoComplete="off"
++              />
++            </div>
++
++            <div className="rounded-md border divide-y max-h-64 overflow-y-auto">
++              {(kandLaddar || (visaSok && sokLaddar)) && (
++                <div className="p-3 text-xs text-muted-foreground flex items-center gap-2">
++                  <Loader2 className="h-3 w-3 animate-spin" /> Söker…
++                </div>
++              )}
++              {!kandLaddar && !(visaSok && sokLaddar) && lista.length === 0 && (
++                <div className="p-3 text-sm text-muted-foreground text-center">
++                  {visaSok ? "Inga träffar" : "Inga liknande paket hittades — sök efter paketnumret ovan."}
++                </div>
++              )}
++              {lista.map((k) => {
++                const vaiktad = vald === k.pktNr;
++                const kand = k as Kandidat;
++                return (
++                  <button
++                    key={k.pktNr}
++                    type="button"
++                    onClick={() => setVald(vaiktad ? null : k.pktNr)}
++                    disabled={arbetar}
++                    className={cn(
++                      "w-full text-left px-3 py-2.5 text-sm transition-colors flex items-start gap-3",
++                      vaiktad ? "bg-green-50 ring-2 ring-inset ring-[#2d5a27]" : "hover:bg-muted/50",
++                    )}
++                  >
++                    <div className="min-w-0 flex-1">
++                      <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
++                        <span className="font-mono font-medium">{k.pktNr}</span>
++                        {kand.saknasIFacket && (
++                          <Badge className="bg-red-100 text-red-800 border border-red-300">Saknas i facket</Badge>
++                        )}
++                        {(kand.orsaker ?? []).filter((o) => o !== "Saknas i facket").map((o) => (
++                          <Badge key={o} variant="secondary" className="font-normal">{o}</Badge>
++                        ))}
++                      </div>
++                      <div className="text-xs text-muted-foreground">{beskriv(k) || "—"}</div>
++                      <div className="text-xs text-muted-foreground">
++                        {k.totalAntal} st · {k.totalM3.toFixed(2)} m³
++                        {k.omradeNamn ? ` · ${k.omradeNamn}${k.fackKod ? " · Fack " + k.fackKod : ""}` : ""}
++                      </div>
++                    </div>
++                    {vaiktad && <CheckCircle2 className="h-5 w-5 text-[#2d5a27] shrink-0 mt-0.5" />}
++                  </button>
++                );
++              })}
++            </div>
++
++            {vald && spec && (
++              <div className="rounded-md border border-[#2d5a27]/30 bg-green-50/60 p-3 text-sm space-y-1">
++                <div className="font-medium flex items-center gap-1.5"><ArrowLeftRight className="h-4 w-4" /> Det här händer:</div>
++                <div><span className="font-mono">{paket.pktNr}</span> läggs tillbaka i lager och räknas som hittat.</div>
++                <div><span className="font-mono">{vald}</span> avrapporteras och ersätter {paket.pktNr} på {spec.etikett}.</div>
++              </div>
++            )}
++          </div>
++        )}
++
++        {avrapportering.kanAterinforas && (
++          <p className="text-sm text-muted-foreground">
++            Paketet sitter inte på någon order. Står det kvar i lagret kan du återinföra det — det läggs tillbaka i
++            lager och räknas som hittat.
++          </p>
++        )}
++
++        <DialogFooter className="gap-2 sm:gap-2 flex-col-reverse sm:flex-row">
++          <Button variant="outline" onClick={onStang} disabled={arbetar}>Avbryt</Button>
++          {kanByta && (
++            <Button
++              onClick={() => vald && onByt(vald)}
++              disabled={!vald || arbetar}
++              className="bg-[#2d5a27] hover:bg-[#224420] text-white"
++            >
++              {arbetar && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
++              {vald ? `Byt mot ${vald}` : "Välj paket att byta mot"}
++            </Button>
++          )}
++          {avrapportering.kanAterinforas && (
++            <Button onClick={onAterinfor} disabled={arbetar} className="bg-[#2d5a27] hover:bg-[#224420] text-white">
++              {arbetar && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
++              Återinför i lager
++            </Button>
++          )}
++        </DialogFooter>
++      </DialogContent>
++    </Dialog>
++  );
++}
+diff --git a/artifacts/lager/src/pages/inventering/InventeringSkanningPage.tsx b/artifacts/lager/src/pages/inventering/InventeringSkanningPage.tsx
+index 3e2943f..c4a9b8e 100644
+--- a/artifacts/lager/src/pages/inventering/InventeringSkanningPage.tsx
++++ b/artifacts/lager/src/pages/inventering/InventeringSkanningPage.tsx
+@@ -19,9 +19,10 @@ import {
+   AlertDialogTitle,
+   AlertDialogTrigger,
+ } from "@/components/ui/alert-dialog";
+-import { ScanBarcode, Camera, CheckCircle2, AlertCircle, Loader2, ArrowLeft, Flag, X } from "lucide-react";
++import { ScanBarcode, Camera, CheckCircle2, AlertCircle, Loader2, ArrowLeft, Flag, X, ChevronDown, ChevronUp } from "lucide-react";
+ import { KLASS_LABEL, KLASS_COLOR, type SessionOversikt, type Klassificering } from "./types";
+ import KameraSkanner from "./KameraSkanner";
++import AvrapporteratPaketDialog, { type AvrapporteratPaket } from "./AvrapporteratPaketDialog";
+ import { omradeskartaHref, sessionsHref } from "@/pages/lagerplatser/inventeringskarta";
+ 
+ type Feedback = { kind: "ok" | "warn" | "error"; text: string } | null;
+@@ -46,6 +47,7 @@ type PaketSokTraff = {
+   fackKod: string | null;
+   blandadPlacering: boolean;
+   deregistrerad: boolean;
++  avrapporterad?: boolean;
+   kanAterstallas: boolean;
+   restaureringsAnledning: string | null;
+ };
+@@ -98,6 +100,9 @@ export default function InventeringSkanningPage() {
+   const [tarBortPktNr, setTarBortPktNr] = useState<string | null>(null);
+   const [deregistreratPaket, setDeregistreratPaket] = useState<DeregistreratPaket | null>(null);
+   const [aterstaller, setAterstaller] = useState(false);
++  const [avrapporteratPaket, setAvrapporteratPaket] = useState<AvrapporteratPaket | null>(null);
++  const [avrapporteratArbetar, setAvrapporteratArbetar] = useState(false);
++  const [visaKvar, setVisaKvar] = useState(false);
+ 
+   const { data: session, isLoading } = useQuery<SessionOversikt>({
+     queryKey: ["/api/inventering", id],
+@@ -132,13 +137,26 @@ export default function InventeringSkanningPage() {
+     try {
+       const valdMetod = metodOverride ?? metod;
+       const result = await customFetch<
+-        | { redanSkannad: boolean; klassificering: Klassificering; session: SessionOversikt; deregistrerad?: false }
+-        | (Omit<DeregistreratPaket, "metod"> & { deregistrerad: true })
++        | { redanSkannad: boolean; klassificering: Klassificering; session: SessionOversikt; deregistrerad?: false; avrapporterad?: false }
++        | (Omit<DeregistreratPaket, "metod"> & { deregistrerad: true; avrapporterad?: false })
++        | (Omit<AvrapporteratPaket, "metod"> & { avrapporterad: true; deregistrerad?: false })
+       >(
+         `/api/inventering/${id}/skanna`,
+         { method: "POST", body: JSON.stringify({ pktNr, metod: valdMetod }) },
+       );
++      if (result.avrapporterad) {
++        setAvrapporteratPaket({ ...result, metod: valdMetod });
++        signalera("warn");
++        setFeedback({
++          kind: "warn",
++          text: result.avrapportering.spec
++            ? `${pktNr} är avrapporterat på ${result.avrapportering.spec.etikett} — välj vad som hänt`
++            : `${pktNr} är avrapporterat men står kvar — välj vad som hänt`,
++        });
++        return;
++      }
+       if (result.deregistrerad) {
++        signalera("warn");
+         setDeregistreratPaket({ ...result, metod: valdMetod });
+         setFeedback({
+           kind: "warn",
+@@ -150,14 +168,17 @@ export default function InventeringSkanningPage() {
+       }
+       queryClient.setQueryData(["/api/inventering", id], result.session);
+       if (result.redanSkannad) {
++        signalera("warn");
+         setFeedback({ kind: "warn", text: `${pktNr} redan skannat i denna inventering` });
+       } else if (result.klassificering === "forvantad_hittad") {
+         setFeedback({ kind: "ok", text: `${pktNr} — stämmer, hör hemma här` });
+       } else {
++        signalera("error");
+         setFeedback({ kind: "error", text: `${pktNr} — ${KLASS_LABEL[result.klassificering]}` });
+       }
+     } catch (err) {
+       const msg = err instanceof Error ? err.message : "Okänt fel";
++      signalera("error");
+       setFeedback({ kind: "error", text: msg });
+     } finally {
+       setScanning(false);
+@@ -167,6 +188,71 @@ export default function InventeringSkanningPage() {
+     }
+   }
+ 
++  // Kort vibration på mobil så att man märker avvikelser utan att titta på skärmen.
++  function signalera(typ: "warn" | "error") {
++    try {
++      navigator.vibrate?.(typ === "error" ? [120, 60, 120] : 120);
++    } catch {
++      /* vibration stöds inte — ignorera */
++    }
++  }
++
++  // Ombyte på order: det avrapporterade paketet står kvar, ett annat paket
++  // plockades i stället. Servern rättar order + lager i ett steg och skannar
++  // in paketet.
++  async function handleByt(ersattAvPktNr: string) {
++    if (!id || !avrapporteratPaket) return;
++    const kandidat = avrapporteratPaket;
++    setAvrapporteratArbetar(true);
++    try {
++      const result = await customFetch<{ order: string; session: SessionOversikt }>(
++        `/api/inventering/${id}/byt-paket`,
++        {
++          method: "POST",
++          body: JSON.stringify({ pktNr: kandidat.pktNr, ersattAvPktNr, metod: kandidat.metod }),
++        },
++      );
++      queryClient.setQueryData(["/api/inventering", id], result.session);
++      queryClient.invalidateQueries({ queryKey: ["/api/inventering/sok-paket"] });
++      setAvrapporteratPaket(null);
++      setFeedback({ kind: "ok", text: `${kandidat.pktNr} hittat · ${ersattAvPktNr} ersätter det på ${result.order}` });
++      toast({
++        title: "Ordern rättad",
++        description: `${kandidat.pktNr} är tillbaka i lager. ${ersattAvPktNr} ligger nu på ${result.order}.`,
++      });
++    } catch (err) {
++      const msg = err instanceof Error ? err.message : "Okänt fel";
++      signalera("error");
++      toast({ title: "Kunde inte byta paket", description: msg, variant: "destructive" });
++    } finally {
++      setAvrapporteratArbetar(false);
++      focusInput();
++    }
++  }
++
++  async function handleAterinforAvrapporterat() {
++    if (!id || !avrapporteratPaket) return;
++    const kandidat = avrapporteratPaket;
++    setAvrapporteratArbetar(true);
++    try {
++      const result = await customFetch<{ session: SessionOversikt }>(`/api/inventering/${id}/aterinfor-avrapporterat`, {
++        method: "POST",
++        body: JSON.stringify({ pktNr: kandidat.pktNr, metod: kandidat.metod }),
++      });
++      queryClient.setQueryData(["/api/inventering", id], result.session);
++      queryClient.invalidateQueries({ queryKey: ["/api/inventering/sok-paket"] });
++      setAvrapporteratPaket(null);
++      setFeedback({ kind: "ok", text: `${kandidat.pktNr} återinfört i lager och hittat` });
++    } catch (err) {
++      const msg = err instanceof Error ? err.message : "Okänt fel";
++      signalera("error");
++      toast({ title: "Kunde inte återinföra paketet", description: msg, variant: "destructive" });
++    } finally {
++      setAvrapporteratArbetar(false);
++      focusInput();
++    }
++  }
++
+   async function handleAterstall() {
+     if (!id || !deregistreratPaket || !deregistreratPaket.kanAterstallas) return;
+     const kandidat = deregistreratPaket;
+@@ -299,12 +385,43 @@ export default function InventeringSkanningPage() {
+       <div className="flex flex-col gap-4 px-4 md:px-8 pt-4 pb-4 md:pb-8 flex-1 min-h-0 overflow-auto">
+         <div className="flex flex-wrap gap-2">
+           <Badge className="bg-blue-100 text-blue-800 border-blue-300 border">{raknare.hittade}/{raknare.forvantadeAntalPaket} hittade</Badge>
+-          <Badge variant="outline">{kvarAttHitta} kvar att hitta</Badge>
++          <button
++            type="button"
++            onClick={(e) => { e.stopPropagation(); setVisaKvar((v) => !v); }}
++            className="inline-flex items-center gap-1 rounded-md border px-2.5 py-0.5 text-xs font-semibold hover:bg-muted transition-colors"
++            title="Visa vilka paket som ännu inte hittats"
++          >
++            {kvarAttHitta} kvar att hitta
++            {kvarAttHitta > 0 && (visaKvar ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />)}
++          </button>
+           {raknare.felplacerade > 0 && <Badge className="bg-orange-100 text-orange-800 border-orange-300 border">{raknare.felplacerade} felplacerade</Badge>}
+           {raknare.okanda > 0 && <Badge className="bg-red-100 text-red-800 border-red-300 border">{raknare.okanda} okända</Badge>}
+           {raknare.otydliga > 0 && <Badge className="bg-yellow-100 text-yellow-800 border-yellow-300 border">{raknare.otydliga} otydliga</Badge>}
+         </div>
+ 
++        {visaKvar && session.saknadePaket.length > 0 && (
++          <div className="rounded-lg border bg-muted/20" onClick={(e) => e.stopPropagation()}>
++            <div className="px-4 py-2 text-xs font-medium text-muted-foreground border-b">
++              Paket som systemet tror ligger i facket men som inte skannats ännu
++            </div>
++            <div className="divide-y max-h-60 overflow-y-auto">
++              {session.saknadePaket.map((k) => (
++                <div key={k.pktNr} className="px-4 py-2 text-sm flex items-baseline justify-between gap-3">
++                  <span className="font-mono font-medium">{k.pktNr}</span>
++                  <span className="text-xs text-muted-foreground text-right">
++                    {[
++                      k.traslag,
++                      k.nomTjocklek || k.nomBredd ? `${k.nomTjocklek ?? "-"}×${k.nomBredd ?? "-"}` : null,
++                      k.langder.length ? `${k.langder.join("+")} dm` : null,
++                      `${k.totalAntal} st`,
++                    ].filter(Boolean).join(" · ")}
++                  </span>
++                </div>
++              ))}
++            </div>
++          </div>
++        )}
++
+         <div
+           className={cn(
+             "rounded-xl border-2 p-6 flex flex-col items-center gap-4 transition-colors cursor-text",
+@@ -376,6 +493,9 @@ export default function InventeringSkanningPage() {
+                           {p.deregistrerad && (
+                             <Badge variant="outline" className="text-amber-700 border-amber-300">Avregistrerat</Badge>
+                           )}
++                          {!p.deregistrerad && p.avrapporterad && (
++                            <Badge variant="outline" className="text-amber-700 border-amber-300">Avrapporterat</Badge>
++                          )}
+                           <span className="text-xs text-muted-foreground">
+                             {[p.traslag, dim, p.langder.length ? `${p.langder.join("+")} dm` : null].filter(Boolean).join(" · ")}
+                           </span>
+@@ -520,6 +640,17 @@ export default function InventeringSkanningPage() {
+         </AlertDialogContent>
+       </AlertDialog>
+ 
++      {id && (
++        <AvrapporteratPaketDialog
++          sessionId={id}
++          paket={avrapporteratPaket}
++          arbetar={avrapporteratArbetar}
++          onByt={handleByt}
++          onAterinfor={handleAterinforAvrapporterat}
++          onStang={() => { setAvrapporteratPaket(null); focusInput(); }}
++        />
++      )}
++
+       {kameraOppen && (
+         <KameraSkanner
+           onPktNrFunnet={handlePktNrFranKamera}
